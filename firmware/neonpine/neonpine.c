@@ -263,6 +263,7 @@ static struct np_status status;
 static uint8_t cmd_buf[8] __attribute__((aligned(4)));
 static volatile uint8_t cmd_pending;
 static uint8_t usb_set_report_id;
+static uint8_t usb_reboot_armed;  // a valid 0xFD report arrived: reboot on its status stage
 // Store page buffer for both directions; the data starts word aligned at store_buf + 4.
 static uint8_t store_buf[68] __attribute__((aligned(4)));
 static volatile uint8_t store_req, store_lock, live_req;
@@ -944,10 +945,30 @@ static void save_task( void )
 
 // ---- USB ---------------------------------------------------------------------------------------
 
+// Reboot into the USB bootloader (rv003usb's sequence), but drop off the bus first: D- low = SE0 for 20 ms,
+// as at power-up. D- is pulled up for good (no pull-up switch), so without this the host never notices the
+// restart. Linux resets the port after ~1 s of failing transfers; Windows doesn't, and never sees the bootloader.
+static void usb_reboot( void )
+{
+	TIM2->CH3CVR = 0;
+	outs_set( 0 );
+	funPinMode( PD4, GPIO_CFGLR_OUT_10Mhz_PP );
+	GPIOD->BSHR = 1u << ( 4 + 16 );
+	Delay_Ms( 20 );
+	FLASH->BOOT_MODEKEYR = FLASH_KEY1;
+	FLASH->BOOT_MODEKEYR = FLASH_KEY2;
+	FLASH->STATR = 1 << 14;  // MODE = 0: boot the bootloader area
+	FLASH->CTLR = CR_LOCK_Set;
+	RCC->RSTSCKR |= 0x1000000;
+	PFIC->SCTLR = 1u << 31;
+}
+
 void usb_handle_user_in_request( struct usb_endpoint * e, uint8_t * scratchpad, int endp, uint32_t sendtok, struct rv003usb_internal * ist )
 {
-	// Only control transfers are used; the interrupt endpoint stays empty.
+	// Only control transfers are used; the interrupt endpoint stays empty. On endpoint 0 this is the status
+	// stage of the 0xFD report (e->custom): acknowledge it, then reboot.
 	usb_send_empty( sendtok );
+	if( !endp && usb_reboot_armed ) usb_reboot();
 }
 
 void usb_handle_hid_get_report_start( struct usb_endpoint * e, int reqLen, uint32_t lValueLSBIndexMSB )
@@ -973,7 +994,9 @@ void usb_handle_hid_set_report_start( struct usb_endpoint * e, int reqLen, uint3
 {
 	int id = usb_set_report_id = lValueLSBIndexMSB & 0xff;
 	int max = id == NP_REPORT_COMMAND ? (int)sizeof( cmd_buf ) : id == NP_REPORT_LIVE ? 21 : id == NP_REPORT_STORE ? (int)sizeof( store_buf ) : 0;
-	if( !max ) return;  // 0xFD (reboot) is handled inside rv003usb
+	usb_reboot_armed = 0;
+	if( id == NP_REPORT_REBOOT ) { e->custom = 1; max = 7; }  // the status stage goes to usb_handle_user_in_request
+	if( !max ) return;
 	if( reqLen > max ) reqLen = max;
 	e->max_len = reqLen;
 }
@@ -981,6 +1004,13 @@ void usb_handle_hid_set_report_start( struct usb_endpoint * e, int reqLen, uint3
 void usb_handle_user_data( struct usb_endpoint * e, int current_endpoint, uint8_t * data, int len, struct rv003usb_internal * ist )
 {
 	int id = usb_set_report_id;
+	if( id == NP_REPORT_REBOOT )
+	{
+		const uint32_t * w = __builtin_assume_aligned( data, 4 );
+		if( !current_endpoint && !e->count++ )  // the magic is in the first packet; ignore padding after it
+			usb_reboot_armed = w[0] == 0xaa3412fd && ( w[1] & 0x00ffffff ) == 0x00ddccbb;
+		return;
+	}
 	uint8_t * dst = id == NP_REPORT_COMMAND ? cmd_buf : id == NP_REPORT_LIVE ? anim_live : id == NP_REPORT_STORE ? store_buf : 0;
 	if( current_endpoint || !dst ) return;
 	if( dst == store_buf && store_lock ) { usb_set_report_id = 0; return; }  // the main loop has the buffer: dropped, the app retries

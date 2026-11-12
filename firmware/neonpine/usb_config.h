@@ -20,14 +20,15 @@
 #define RV003USB_HID_FEATURES      1
 // Feature report 0xFD 12 34 AA BB CC DD reboots into the USB bootloader.
 // minichlink sends it on its own when it finds 1209:D003 instead of the bootloader (1209:B003).
-#define RV003USB_USE_REBOOT_FEATURE_REPORT 1
+// neonpine.c handles it instead of rv003usb, so it can drop off the bus before the reset (see usb_reboot).
+#define RV003USB_USE_REBOOT_FEATURE_REPORT 0
 
 // Feature report IDs, see neonpine.c, ../tools/npctl.py and ../../companion
 #define NP_REPORT_STATUS  0xaa  // GET: 64-byte status block
 #define NP_REPORT_COMMAND 0xab  // SET: 8-byte command
 #define NP_REPORT_LIVE    0xac  // SET: live frame, 20 electrode levels
 #define NP_REPORT_STORE   0xae  // SET / GET: store page [page][op / state][0][64 bytes]
-#define NP_REPORT_REBOOT  0xfd  // SET: reboot to bootloader (handled inside rv003usb)
+#define NP_REPORT_REBOOT  0xfd  // SET: reboot to bootloader (magic 12 34 AA BB CC DD)
 
 #ifndef __ASSEMBLER__
 

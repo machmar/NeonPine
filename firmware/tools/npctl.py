@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""NeonPine firmware – USB monitor / control (Linux hidraw, no extra packages).
+"""NeonPine firmware – USB monitor / control (Linux hidraw, Windows hid.dll; no extra packages).
+The transport is the companion app's hid_backend (../../companion/neonpine_companion).
 
   npctl.py                 status once
   npctl.py watch           status every 0.2 s
@@ -25,13 +26,14 @@
   npctl.py clear           clear a fault
   npctl.py bootloader      reboot into the USB bootloader (minichlink does this by itself)
 """
-import fcntl
-import glob
 import os
 import re
 import struct
 import sys
 import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "companion"))
+from neonpine_companion import hid_backend  # noqa: E402
 
 VID, PID = 0x1209, 0xD003
 REPORT_STATUS, REPORT_COMMAND, REPORT_REBOOT = 0xAA, 0xAB, 0xFD
@@ -46,29 +48,17 @@ LAMP = ["--", "L", "R", "LR"]  # lit electrodes: left (pad 1, K switch), right (
 STATUS_FMT = "<BBBBBBBBHHHHHHHHIIBBBBBBBBBBHHBBHHBBBBHHI"  # see struct np_status in neonpine.c (fw v3)
 
 
-def ioc(nr, size):
-    return (3 << 30) | (size << 16) | (ord("H") << 8) | nr  # _IOC(_IOC_READ|_IOC_WRITE, 'H', nr, size)
+def open_device():
+    found = hid_backend.enumerate_devices(VID, PID)
+    if not found:
+        sys.exit("NeonPine firmware (%04x:%04x) not found – still in the bootloader, or (Linux) no udev rule?" % (VID, PID))
+    return hid_backend.HidDevice(found[0])
 
 
-def find_device():
-    want = "HID_ID=0003:%08X:%08X" % (VID, PID)
-    for d in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
-        try:
-            with open(os.path.join(d, "device/uevent")) as f:
-                if want in f.read().upper():
-                    return "/dev/" + os.path.basename(d)
-        except OSError:
-            pass
-    sys.exit("NeonPine firmware (%04x:%04x) not found – still in the bootloader, or no udev rule?" % (VID, PID))
-
-
-def get_status(fd):
-    buf = bytearray(struct.calcsize(STATUS_FMT))
-    buf[0] = REPORT_STATUS
-    n = fcntl.ioctl(fd, ioc(0x07, len(buf)), buf)  # HIDIOCGFEATURE
-    if n < len(buf):  # fw v2: 52 bytes, no store fields
-        buf[n:] = bytes(len(buf) - n)
-    return struct.unpack(STATUS_FMT, bytes(buf))
+def get_status(dev):
+    size = struct.calcsize(STATUS_FMT)
+    buf = dev.get_feature(REPORT_STATUS, size).ljust(size, b"\0")  # fw v2: 52 bytes, no store fields
+    return struct.unpack(STATUS_FMT, buf[:size])
 
 
 def show_name(n):
@@ -77,9 +67,8 @@ def show_name(n):
     return "live" if n == 15 else "custom%d" % (n - 16) if 16 <= n < 24 else str(n)
 
 
-def send(fd, report_id, payload):
-    buf = bytearray([report_id]) + bytes(payload)
-    fcntl.ioctl(fd, ioc(0x06, len(buf)), buf)  # HIDIOCSFEATURE
+def send(dev, report_id, payload):
+    dev.set_feature(bytes([report_id]) + bytes(payload))
 
 
 def command(fd, cmd, args=b""):
@@ -133,7 +122,7 @@ def parse_lamps(args):
 
 def main():
     args = sys.argv[1:]
-    fd = os.open(find_device(), os.O_RDWR)
+    fd = open_device()
     try:
         if not args:
             show(get_status(fd))
@@ -192,7 +181,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        os.close(fd)
+        fd.close()
 
 
 if __name__ == "__main__":

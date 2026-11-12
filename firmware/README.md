@@ -5,7 +5,9 @@
 | `bootloader/` | [rv003usb](https://github.com/cnlohr/rv003usb) USB HID bootloader (1209:B003) in the CH32V003's 1920‑byte boot area, configured for D+ = PD2, D− = PD4, no D− pull‑up pin |
 | `neonpine/` | The firmware (1209:D003): HV boost, the 8 simulator animations (`anim.c`), touch UI, light sensor, sleep timer, bring‑up shows, status over USB |
 | `installer/` | Writes the bootloader + option bytes from the chip itself, for programmers that only write main flash (PicoRVD) |
-| `tools/npctl.py` | Talks to the firmware over USB (Linux hidraw, no pip packages) |
+| `tools/npctl.py` | Talks to the firmware over USB (Linux hidraw / Windows hid.dll via the companion's `hid_backend`, no pip packages) |
+| `tools/npflash.py` | Flashes the firmware over USB with the companion's flasher (Linux + Windows), verified |
+| `np.ps1` | Windows: build, flash and control from PowerShell (see *Setup › Windows*) |
 | `../companion/` | The **NeonPine Companion** desktop app (Linux + Windows, tray): animations, custom keyframe animations, live modes, settings, diagnostics, firmware updates |
 | `tools/gen_anim_tables.py` | Generates `neonpine/anim_tables.h` (sine, e^−x, noise permutation) |
 | `tools/99-neonpine.rules` | udev rule: user access to the bootloader, the firmware and the WCH‑LinkE |
@@ -16,6 +18,34 @@ sudo pacman -S --needed riscv64-elf-gcc riscv64-elf-newlib   # toolchain; libusb
 sudo cp tools/99-neonpine.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
 make            # clones rv003usb + ch32fun (pinned) into deps/, builds minichlink, bootloader and firmware
 ```
+
+### Windows
+[MSYS2](https://www.msys2.org/) in `C:\msys64` (or set `MSYS2_ROOT`) and Python 3.9+. The tree needs no driver.
+```powershell
+C:\msys64\usr\bin\pacman -S --needed make git python mingw-w64-x86_64-riscv64-unknown-elf-toolchain
+py -m venv ..\companion\.venv; ..\companion\.venv\Scripts\python -m pip install -r ..\companion\requirements.txt   # only for the app
+.\np.ps1 make deps
+.\np.ps1 build
+```
+`np.ps1` wraps everything (it puts MSYS2 on the PATH for make and uses the companion venv's Python if there is one):
+
+| | |
+|---|---|
+| `.\np.ps1 build` | bootloader + firmware + installer |
+| `.\np.ps1 flash` | build, then flash over USB with `tools/npflash.py` (verified; settings and custom animations stay). `-Wait 60` waits for a replug |
+| `.\np.ps1 flash-mc` | build, then `make flash` (minichlink) |
+| `.\np.ps1 make <target>` | any Makefile target (`first-flash`, `flash-swd`, `clean`, …) |
+| `.\np.ps1 app` | the companion app from source |
+| `.\np.ps1 status`, `watch`, `show garland`, `style retro`, … | `tools/npctl.py` |
+
+MSYS2's riscv64 GCC 14 has no rv32ec multilib; that's fine, ch32fun links its own `misc/libgcc.a`.
+Its build of `neonpine.bin` is 15 352 of the 15 360 bytes allowed.
+
+**Firmware older than the Windows reboot fix** (USB reboot report handled by rv003usb itself): Windows never sees the
+bootloader after a soft reboot, because the chip restarts without leaving the bus and Windows, unlike Linux, doesn't
+reset the port. Flash once through the power-up window, `.\np.ps1 flash -Wait 120`, and unplug/replug the tree while it
+waits. From then on the firmware drops off the bus (D− low 20 ms) before it reboots, and `flash` / `flash-mc` / the app work
+with no replug.
 
 ## First flash (once per board, SWD)
 WCH‑LinkE on the J2 pogo pads `5V – SWIO – GND` (pin 1 = square = 5V), rear cover off.
@@ -241,9 +271,11 @@ Feature reports on 1209:D003 (see `usb_config.h`, `../companion/neonpine_compani
 | 0xFD | SET | 7 | reboot into the bootloader (rv003usb) |
 
 ## Notes
-* The board has no switchable D− pull‑up, so the host doesn't notice when the chip restarts into the bootloader. Whoever
-  asks for the reboot has to keep talking to the old device until the host resets the port (Linux: after ~1 s of errors,
-  while the hidraw node is open) – minichlink and the app both do that.
+* The board has no switchable D− pull‑up, so the host wouldn't notice when the chip restarts into the bootloader. The
+  firmware therefore handles the 0xFD reboot report itself (`usb_reboot` in `neonpine.c`, rv003usb's
+  `RV003USB_USE_REBOOT_FEATURE_REPORT` is off): it acks the status stage, holds D− low for 20 ms (SE0 = unplugged) and
+  then resets into the bootloader, which the host enumerates as a new device. The application does the same at start-up,
+  for the way back.
 * Pinned libraries: rv003usb `16d5cd4` with ch32fun `1e4887e` (see `Makefile`); `bootloader/bootloader.c` and the linker script are
   unmodified copies from that commit, with the configuration in `bootloader/usb_config.h`.
 * VID:PID 1209:D003 / 1209:B003 are rv003usb's shared pid.codes IDs, fine for development. A product needs its own PID.

@@ -71,5 +71,6 @@ to the workflow run.
 
 The protocol is documented in `../firmware/README.md` (USB protocol) and at the top of `device.py`.
 
-Untested so far: the Windows HID backend, WASAPI loopback capture and Windows builds (written against the Win32 API, not run yet) and macOS
+The Windows HID backend and the flasher work on Windows 11 (board 1, 2026-11-12; the flasher needs the firmware with the
+Windows reboot fix, see `../firmware/README.md`). Untested so far: WASAPI loopback capture and Windows builds (written against the Win32 API, not run yet) and macOS
 (it should work through `pip install hidapi`).
