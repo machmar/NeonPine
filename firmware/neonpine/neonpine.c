@@ -38,6 +38,7 @@
 #include "rv003usb.h"
 #include "ch32v003_touch.h"
 #include "anim.h"
+#include "np_usb.h"
 
 #define FW_VERSION 3
 #define Q 4096  // Q12 fixed point: 1.0
@@ -127,7 +128,7 @@ enum { GESTURE_TAP = 1, GESTURE_DOUBLE = 2, GESTURE_HOLD = 3, GESTURE_LONG = 4, 
 #define USER_LEVEL_MIN       8
 
 // Light sensor: TEPT4400 + 22k, DESIGN.md: 100 lx -> 4.4 V, i.e. 44 mV per lux.
-#define LIGHT_SLOT_MS     100      // a dark slot (all lamps off) this often
+#define LIGHT_SLOT_MS     100      // a dark slot (all lamps off) this often (ms_task counts it as ms100)
 #define DARK_SLOT_US      500      // long enough for the phototransistor + 22k to settle
 #define MV_PER_LUX        44
 #define AUTO_OFF_LUX      100      // simulator: 150 lx, but with 22k the sensor saturates at ~110 lx
@@ -137,6 +138,9 @@ enum { GESTURE_TAP = 1, GESTURE_DOUBLE = 2, GESTURE_HOLD = 3, GESTURE_LONG = 4, 
 #define WAVE_MIN_REFL     30       // reflection rise needed (own light per unit duty, counts)
 #define WAVE_MIN_SAMPLES  2        // a wave lasts 0.2 .. 1.5 s
 #define WAVE_MAX_SAMPLES  15
+#ifndef LIGHT_DARK_SLOT
+#define LIGHT_DARK_SLOT   0        // 1: the dark slot above (lamp_pwm, ms_task); off while Q2 isn't fitted
+#endif
 
 #define SEQ_CHARGE   0   // HV up, all dark
 #define SEQ_LAMP0    1   // 1..20: lamp (s-1)/2, K then A
@@ -214,66 +218,22 @@ struct cfg_page {
 _Static_assert( sizeof( struct cfg_page ) == 64, "settings page" );
 #define CFG_SUM 62
 
-struct np_status {
-	uint8_t  report_id;   //  0 = NP_REPORT_STATUS
-	uint8_t  fw_version;  //  1
-	uint8_t  mode;        //  2
-	uint8_t  step;        //  3 test sequence step
-	uint8_t  fault;       //  4
-	uint8_t  flags;       //  5 b0 touched, b1 paused, b2 boost running
-	uint8_t  hv_set;      //  6 V (current HV target)
-	uint8_t  period_us;   //  7 boost period, us
-	uint16_t hv_cv;       //  8 measured HV, 10 mV units
-	uint16_t vdd_mv;      // 10 from Vrefint
-	uint16_t adc_vfb;     // 12
-	uint16_t adc_ldr;     // 14 light sensor, average with the lamps as they are
-	uint16_t touch;       // 16 raw touch sum
-	uint16_t touch_base;  // 18
-	uint16_t ton;         // 20 gate on-time, ticks
-	uint16_t duty_pm;     // 22 share of boost periods that pulsed, per mille
-	uint32_t uptime_ms;   // 24
-	uint32_t lamps;       // 28 which electrodes are lit (2 bits per lamp: b0 left/K, b1 right/A)
-	uint8_t  level;       // 32 brightness 0-255 (test shows: level, animations: duty factor)
-	uint8_t  budget;      // 33 power budget scale, 255 = no limit
-	uint8_t  pwm_ms;      // 34 PWM frame
-	uint8_t  pwm_min_10us;// 35 minimum on-time, 10 us units
-	uint8_t  show;        // 36
-	uint8_t  style;       // 37
-	uint8_t  user_level;  // 38 overall brightness (touch hold ramp)
-	uint8_t  gesture;     // 39 last gesture (low nibble) + event counter (high nibble)
-	uint8_t  sleep_min;   // 40 sleep timer, minutes left (0 = off)
-	uint8_t  flags2;      // 41 b0 sleep timer, b1 off for daylight, b2 light sensor features, b3 rail dimming
-	uint16_t ambient;     // 42 light sensor in the dark slot (room light only), ADC counts
-	uint16_t reflection;  // 44 own light seen by the sensor per unit duty
-	uint8_t  lux;         // 46
-	uint8_t  adapt;       // 47 room-adaptive brightness factor, /255
-	uint16_t late_us;     // 48 latest lamp edge in the last 100 ms (how late an on/off switch happened)
-	uint16_t late_peak_us;// 50 the same since the previous status read
-	uint8_t  caps;        // 52 b0 store, b1 live frames, b2 animation parameters
-	uint8_t  store_pages; // 53
-	uint8_t  n_custom;    // 54 valid custom animations in the store
-	uint8_t  cfg_flags;   // 55 settings flags (CFG_*), b7 unsaved changes
-	uint16_t store_gen;   // 56 counts store writes (the app re-reads when it changes)
-	uint16_t stack_free;  // 58 bytes of stack never used since power-up
-	uint32_t uid;         // 60 chip unique ID (folded to 32 bits)
-} __attribute__((packed, aligned(4)));
-_Static_assert( sizeof( struct np_status ) == 64, "status report is 63 bytes + id (usb_config.h)" );
 
-static struct np_status status;
-static uint8_t cmd_buf[8] __attribute__((aligned(4)));
-static volatile uint8_t cmd_pending;
-static uint8_t usb_set_report_id;
-static uint8_t usb_reboot_armed;  // a valid 0xFD report arrived: reboot on its status stage
+// Shared with the USB hooks in usb.c (np_usb.h)
+struct np_status status;
+uint8_t cmd_buf[8] __attribute__((aligned(4)));
+volatile uint8_t cmd_pending;
 // Store page buffer for both directions; the data starts word aligned at store_buf + 4.
-static uint8_t store_buf[68] __attribute__((aligned(4)));
-static volatile uint8_t store_req, store_lock, live_req;
-static volatile uint32_t store_req_ms;  // a page write waits a few ms, so the USB transfer's status stage is done first
+uint8_t store_buf[68] __attribute__((aligned(4)));
+volatile uint8_t store_req, store_lock, live_req;
+volatile uint32_t store_req_ms;  // a page write waits a few ms, so the USB transfer's status stage is done first
 #define store_cfg ( (struct cfg_page *)( store_buf + 4 ) )
 #define flash_cfg ( (const struct cfg_page *)STORE_ADDR )
 static uint16_t store_gen;
 
 // ---- State -------------------------------------------------------------------------------------
-static uint32_t now_ms;
+uint32_t now_ms;
+static uint8_t ms100;  // now_ms % 100, once per ms (a % is a library call: there is no divider)
 static uint8_t mode = MODE_AUTO, step, paused, fault;
 static uint16_t step_ms;
 static uint32_t manual_lamps;
@@ -331,14 +291,16 @@ static uint16_t touch_raw, touch_base, touch_delta = TOUCH_DELTA_DEFAULT;
 static uint8_t touched, touch_count;
 
 // Light sensor
+#if LIGHT_DARK_SLOT
 static volatile uint8_t dark_req, dark_done;
+#endif
 static uint16_t ldr_dark;
 static uint32_t ldr_acc, duty_acc, ldr_n;
 static uint32_t lux;
 
 static uint32_t outs_now = 0xffffffff;
 static uint32_t late_max, late_peak;  // SysTick ticks
-static volatile uint8_t status_read;
+volatile uint8_t status_read;
 static uint8_t job_touch, job_light, job_status, job_scale, job_save, job_stack;  // deferred work, run in gaps between lamp edges
 
 // ---- Lamp outputs ------------------------------------------------------------------------------
@@ -423,8 +385,8 @@ static void publish_lamp( void )
 	{
 		int32_t d = (int32_t)pub_level * pub_level * Q / ( 255 * 255 );
 		int s = pub_level ? ( pub_lamps >> ( 2 * i ) ) & 3 : LAMP_OFF;
-		lamp_times( i, s == LAMP_K ? d : s == LAMP_AC ? d / 2 : 0,
-		               s == LAMP_A ? d : s == LAMP_AC ? d / 2 : 0 );
+		lamp_times( i, s == LAMP_K ? d : s == LAMP_AC ? d >> 1 : 0,
+		               s == LAMP_A ? d : s == LAMP_AC ? d >> 1 : 0 );
 	}
 	else
 	{
@@ -486,38 +448,35 @@ static int adc_read( int ch )
 	return ADC1->RDATAR;
 }
 
-static void measure_vdd( void )  // at start-up: 8 conversions at once
+// Sum of 8 Vrefint conversions -> VDD, then the HV scaling for it.
+static void vdd_set( uint32_t sum )
 {
-	adc_read( ADC_CH_VREF );  // TSVREFE may just have been switched back on
-	int sum = 0;
-	for( int i = 0; i < 8; i++ ) sum += adc_read( ADC_CH_VREF );
-	if( sum < 8 ) return;
-	uint32_t mv = 1200u * 1023u * 8u / sum;  // Vrefint nominal 1.2 V
-	if( mv < 4000 || mv > 5600 ) mv = 5000;  // implausible -> assume nominal USB 5 V
-	vdd_mv = mv;
-}
-
-static void hv_scale_update( void )
-{
+	if( sum >= 8 )
+	{
+		uint32_t mv = 1200u * 1023u * 8u / sum;  // Vrefint nominal 1.2 V
+		vdd_mv = mv < 4000 || mv > 5600 ? 5000 : mv;  // implausible -> assume nominal USB 5 V
+	}
 	// hv_mv = counts * VDD / 1023 * 2039 / 39, without divisions in the 1 ms task
 	mv_per_count_q4 = ( ( DIV_TOP_K + DIV_BOT_K ) * vdd_mv << 4 ) / ( 1023u * DIV_BOT_K );
 	count_per_mv_q20 = ( 1023u * DIV_BOT_K << 12 ) / ( ( DIV_TOP_K + DIV_BOT_K ) * vdd_mv >> 8 );
 	vfb_trip = HV_TRIP_MV * count_per_mv_q20 >> 20;
 }
 
-static void vdd_task( uint32_t ms )  // running: one conversion per ms (ms 10..17 of every 100), keeps passes short
+static void measure_vdd( void )  // at start-up: 8 conversions at once
+{
+	adc_read( ADC_CH_VREF );  // TSVREFE may just have been switched back on
+	uint32_t sum = 0;
+	for( int i = 0; i < 8; i++ ) sum += adc_read( ADC_CH_VREF );
+	vdd_set( sum );
+}
+
+static void vdd_task( uint32_t k )  // running: one conversion per ms (k = ms % 100 = 10..17), keeps passes short
 {
 	static uint32_t sum;
-	uint32_t k = ms % 100;
 	if( k < 10 || k > 17 ) return;
 	if( k == 10 ) sum = 0;
 	sum += adc_read( ADC_CH_VREF );
-	if( k == 17 && sum >= 8 )
-	{
-		uint32_t mv = 1200u * 1023u * 8u / sum;
-		vdd_mv = mv < 4000 || mv > 5600 ? 5000 : mv;
-		hv_scale_update();
-	}
+	if( k == 17 ) vdd_set( sum );
 }
 
 // ---- Boost -------------------------------------------------------------------------------------
@@ -581,6 +540,7 @@ static void set_style( int st )
 {
 	style = st;
 	pwm_min_us = st == STYLE_RETRO ? PWM_MIN_US_RETRO : PWM_MIN_US_NORMAL;
+	status.pwm_min_10us = pwm_min_us / 10;
 	anim_dark = st == STYLE_RETRO;
 }
 
@@ -668,6 +628,57 @@ static void on_gesture( int g )
 
 // ---- Touch -------------------------------------------------------------------------------------
 
+// ch32fun's ReadTouchPin( GPIOA, 2, ADC_CH_TOUCH, 3 ) (ch32v003_touch.h), rolled up to save flash and RAM
+// (it runs from RAM): the three copies of its INNER_LOOP, with 0 / 2 / 4 nops between starting the ADC and
+// releasing the pin, are one loop body that jumps into a 4-nop sled. Same sequence, 9 samples; the jump adds
+// the same couple of cycles to all three phases.
+// FORCEALIGNADC from ch32v003_touch.h, but its jump doesn't link: the original "jalr a2, 1" writes ra
+// without declaring it, which breaks a leaf function (its return jumps back into itself). Same timing.
+#define TOUCH_ALIGN \
+	__asm__ volatile( ".balign 4\n" \
+		"andi a2, %[cnt], 3\nc.slli a2, 1\nc.addi a2, 12\nauipc a1, 0\nc.add a2, a1\njalr zero, 1(a2)\n" \
+		".long 0x00010001\n.long 0x00010001\n" :: [cnt] "r"( SysTick->CNT ) : "a1", "a2" );
+
+static uint32_t touch_read( void ) __attribute__((noinline, section(".srodata")));
+static uint32_t touch_read( void )
+{
+	GPIO_TypeDef * io = GPIOA;
+	uint32_t ret = 0;
+
+	__disable_irq();
+	TOUCH_ALIGN
+	ADC1->RSQR3 = ADC_CH_TOUCH;
+	ADC1->SAMPTR2 = TOUCH_ADC_SAMPLE_TIME << ( 3 * ADC_CH_TOUCH );
+	__enable_irq();
+
+	uint32_t base = io->CFGLR & ~( 0xfu << 8 );
+	uint32_t cfg_float = ( GPIO_CFGLR_IN_PUPD << 8 ) | base, cfg_drive = ( GPIO_CFGLR_OUT_2Mhz_PP << 8 ) | base;
+	uint32_t skip = 8;  // bytes of the sled to jump over: 8, 4, 0 = 0, 2, 4 nops run (set before the alignment)
+	for( int i = 0; i < 9; i++, skip = skip ? skip - 4 : 8 )
+	{
+		__disable_irq();
+		TOUCH_ALIGN
+		// start the ADC before the pin transition (catches it on the slope), then release the pin: pull-down
+		__asm__ volatile(
+			"la t0, 1f\n"
+			"add t0, t0, %[skip]\n"
+			"sw %[start], 8(%[adc])\n"  // ADC1->CTLR2
+			"jr t0\n"
+			"1: c.nop\nc.nop\nc.nop\nc.nop\n"
+			"sw %[flt], 0(%[io])\n"     // io->CFGLR
+			"sw %[pd], 16(%[io])\n"     // io->BSHR
+			:: [skip] "r"( skip ), [start] "r"( ADC_SWSTART | ADC_ADON | ADC_EXTSEL ), [adc] "r"( ADC1 ),
+			   [flt] "r"( cfg_float ), [io] "r"( io ), [pd] "r"( 1u << ( 2 + 16 ) )
+			: "t0", "memory" );
+		__enable_irq();
+		while( !( ADC1->STATR & ADC_EOC ) );
+		io->CFGLR = cfg_drive;
+		io->BSHR = 1u << 2;
+		ret += ADC1->RDATAR;
+	}
+	return ret;
+}
+
 // Every 20 ms.
 static void touch_task( void )
 {
@@ -678,7 +689,7 @@ static void touch_task( void )
 	uint32_t ms = now_ms;
 
 	adc_claim();
-	touch_raw = ReadTouchPin( GPIOA, 2, ADC_CH_TOUCH, 3 );
+	touch_raw = touch_read();
 	(void)ADC1->RDATAR;  // leave EOC clear
 
 	if( samples < 16 )  // first 16 reads (0.3 s): baseline, the pad must not be touched at power-up
@@ -689,9 +700,9 @@ static void touch_task( void )
 	}
 
 	// Hysteresis: press above base + delta, release below base + delta / 2.
-	int above = touch_raw > touch_base + ( touched ? touch_delta / TOUCH_RELEASE_DIV : touch_delta );
-	if( !above && touch_raw < touch_base + touch_delta / TOUCH_RELEASE_DIV )
-		touch_base = ( touch_base * 63 + touch_raw ) / 64;  // follow slow drift while untouched
+	int above = touch_raw > touch_base + ( touched ? touch_delta / (unsigned)TOUCH_RELEASE_DIV : touch_delta );
+	if( !above && touch_raw < touch_base + touch_delta / (unsigned)TOUCH_RELEASE_DIV )
+		touch_base = ( touch_base * 63u + touch_raw ) / 64;  // follow slow drift while untouched
 
 	if( above ) { if( touch_count < 2 ) touch_count++; }
 	else touch_count = 0;
@@ -755,7 +766,7 @@ static int32_t adapt_from_lux( uint32_t lx )
 // Every LIGHT_SLOT_MS, once the dark slot has been read.
 static void light_task( void )
 {
-	static int32_t amb_s32, refl_s32;  // slow averages (x32)
+	static uint32_t amb_s32, refl_s32;  // slow averages (x32), never negative: unsigned shifts
 	static uint8_t cand, cooldown = 30, confirm;
 
 	uint32_t lit = ldr_n ? ldr_acc / ldr_n : 0;
@@ -765,7 +776,7 @@ static void light_task( void )
 	uint32_t amb = ldr_dark;
 	uint32_t own = lit > amb ? lit - amb : 0;
 	uint32_t refl = own * 1024 / ( duty > 205 ? duty : 205 );  // own light per unit duty
-	lux = amb * vdd_mv / 1023 / MV_PER_LUX;
+	lux = amb * vdd_mv / ( 1023 * MV_PER_LUX );
 	status.ambient = amb;
 	status.reflection = refl > 65535 ? 65535 : refl;
 	status.adc_ldr = lit;
@@ -784,10 +795,10 @@ static void light_task( void )
 	}
 
 	// Wave: a short shadow (room lit) or a short rise of the tree's light reflected back (dark room)
-	int32_t amb_slow = amb_s32 / 32, refl_slow = refl_s32 / 32;
-	int32_t rise = refl_slow / 2 > WAVE_MIN_REFL ? refl_slow / 2 : WAVE_MIN_REFL;
-	int shadow = amb_slow > WAVE_MIN_AMB && amb * 10 < (uint32_t)amb_slow * 7;
-	int reflect = lamps_lit && (int32_t)refl > refl_slow + rise;
+	uint32_t amb_slow = amb_s32 / 32, refl_slow = refl_s32 / 32;
+	uint32_t rise = refl_slow / 2 > WAVE_MIN_REFL ? refl_slow / 2 : WAVE_MIN_REFL;
+	int shadow = amb_slow > WAVE_MIN_AMB && amb * 10 < amb_slow * 7;
+	int reflect = lamps_lit && refl > refl_slow + rise;
 	if( cooldown ) cooldown--;
 	if( shadow || reflect )
 	{
@@ -944,88 +955,12 @@ static void save_task( void )
 }
 
 // ---- USB ---------------------------------------------------------------------------------------
+// The report hooks and the reboot are in usb.c (built with the stock flags, see there).
 
-// Reboot into the USB bootloader (rv003usb's sequence), but drop off the bus first: D- low = SE0 for 20 ms,
-// as at power-up. D- is pulled up for good (no pull-up switch), so without this the host never notices the
-// restart. Linux resets the port after ~1 s of failing transfers; Windows doesn't, and never sees the bootloader.
-static void usb_reboot( void )
+void np_outputs_off( void )  // boost gate low, every lamp switch off
 {
 	TIM2->CH3CVR = 0;
 	outs_set( 0 );
-	funPinMode( PD4, GPIO_CFGLR_OUT_10Mhz_PP );
-	GPIOD->BSHR = 1u << ( 4 + 16 );
-	Delay_Ms( 20 );
-	FLASH->BOOT_MODEKEYR = FLASH_KEY1;
-	FLASH->BOOT_MODEKEYR = FLASH_KEY2;
-	FLASH->STATR = 1 << 14;  // MODE = 0: boot the bootloader area
-	FLASH->CTLR = CR_LOCK_Set;
-	RCC->RSTSCKR |= 0x1000000;
-	PFIC->SCTLR = 1u << 31;
-}
-
-void usb_handle_user_in_request( struct usb_endpoint * e, uint8_t * scratchpad, int endp, uint32_t sendtok, struct rv003usb_internal * ist )
-{
-	// Only control transfers are used; the interrupt endpoint stays empty. On endpoint 0 this is the status
-	// stage of the 0xFD report (e->custom): acknowledge it, then reboot.
-	usb_send_empty( sendtok );
-	if( !endp && usb_reboot_armed ) usb_reboot();
-}
-
-void usb_handle_hid_get_report_start( struct usb_endpoint * e, int reqLen, uint32_t lValueLSBIndexMSB )
-{
-	int id = lValueLSBIndexMSB & 0xff;
-	if( id == NP_REPORT_STATUS )
-	{
-		if( reqLen > (int)sizeof( status ) ) reqLen = sizeof( status );
-		e->opaque = (uint8_t *)&status;
-		e->max_len = reqLen;
-		status_read = 1;
-	}
-	else if( id == NP_REPORT_STORE )
-	{
-		if( reqLen > (int)sizeof( store_buf ) ) reqLen = sizeof( store_buf );
-		store_buf[0] = NP_REPORT_STORE;
-		e->opaque = store_buf;
-		e->max_len = reqLen;
-	}
-}
-
-void usb_handle_hid_set_report_start( struct usb_endpoint * e, int reqLen, uint32_t lValueLSBIndexMSB )
-{
-	int id = usb_set_report_id = lValueLSBIndexMSB & 0xff;
-	int max = id == NP_REPORT_COMMAND ? (int)sizeof( cmd_buf ) : id == NP_REPORT_LIVE ? 21 : id == NP_REPORT_STORE ? (int)sizeof( store_buf ) : 0;
-	usb_reboot_armed = 0;
-	if( id == NP_REPORT_REBOOT ) { e->custom = 1; max = 7; }  // the status stage goes to usb_handle_user_in_request
-	if( !max ) return;
-	if( reqLen > max ) reqLen = max;
-	e->max_len = reqLen;
-}
-
-void usb_handle_user_data( struct usb_endpoint * e, int current_endpoint, uint8_t * data, int len, struct rv003usb_internal * ist )
-{
-	int id = usb_set_report_id;
-	if( id == NP_REPORT_REBOOT )
-	{
-		const uint32_t * w = __builtin_assume_aligned( data, 4 );
-		if( !current_endpoint && !e->count++ )  // the magic is in the first packet; ignore padding after it
-			usb_reboot_armed = w[0] == 0xaa3412fd && ( w[1] & 0x00ffffff ) == 0x00ddccbb;
-		return;
-	}
-	uint8_t * dst = id == NP_REPORT_COMMAND ? cmd_buf : id == NP_REPORT_LIVE ? anim_live : id == NP_REPORT_STORE ? store_buf : 0;
-	if( current_endpoint || !dst ) return;
-	if( dst == store_buf && store_lock ) { usb_set_report_id = 0; return; }  // the main loop has the buffer: dropped, the app retries
-	int offset = e->count << 3;
-	int torx = e->max_len - offset;
-	if( torx > len ) torx = len;
-	if( torx <= 0 ) return;
-	memcpy( dst + offset, data, torx );  // the live frame goes straight into anim_live
-	e->count++;
-	if( offset + torx >= e->max_len )
-	{
-		if( id == NP_REPORT_COMMAND ) cmd_pending = 1;
-		else if( id == NP_REPORT_LIVE ) live_req = 1;
-		else { store_req = 1; store_req_ms = now_ms; }
-	}
 }
 
 static void handle_command( void )
@@ -1071,6 +1006,8 @@ static void handle_command( void )
 		if( m > f * 1000 ) m = f * 1000;
 		pwm_frame_us = f * 1000;
 		pwm_min_us = m;
+		status.pwm_ms = f;
+		status.pwm_min_10us = m / 10 > 255 ? 255 : m / 10;
 		break;
 	}
 	case CMD_STYLE:
@@ -1094,6 +1031,7 @@ static void handle_command( void )
 		break;
 	case CMD_PERIOD:
 		period = arg16 > PERIOD_MAX ? PERIOD_MAX : arg16 < ton + PERIOD_MARGIN ? ton + PERIOD_MARGIN : arg16;
+		status.period_us = period / 48;
 		TIM2->ATRLR = period - 1;  // preloaded (ARPE): takes effect at the next update
 		break;
 	case CMD_TOUCH_DELTA:
@@ -1159,6 +1097,8 @@ static void ms_task( void )
 {
 	static uint32_t anim_last, pub_key;
 	uint32_t ms = ++now_ms;
+	ms100 = ms % 100;
+	uint32_t ms20 = ms % 20;
 	anim_tick_ms();
 
 	if( cmd_pending ) handle_command();
@@ -1189,7 +1129,7 @@ static void ms_task( void )
 	int animating = on && mode == MODE_AUTO && IS_ANIM( show );
 
 	// HV regulation targets (VDD is re-measured every 100 ms).
-	vdd_task( ms );
+	vdd_task( ms100 );
 	hv_mv = vfb_last * mv_per_count_q4 >> 4;
 	hv_target_mv = on ? hv_target( animating ) : 0;
 
@@ -1299,13 +1239,13 @@ static void ms_task( void )
 	if( !budget_enabled ) budget = 256;
 	else if( boost_on && lamps_lit )
 	{
-		if( hv_avg + BUDGET_SAG_MV < ramp_mv ) { if( budget > BUDGET_MIN ) budget -= budget / 64 + 1; }
+		if( hv_avg + BUDGET_SAG_MV < ramp_mv ) { if( budget > BUDGET_MIN ) budget -= budget / 64u + 1; }
 		else if( hv_avg + BUDGET_OK_MV >= ramp_mv && budget < 256 ) budget++;
 	}
 	if( budget != old_budget ) job_scale = 1;
 
 	// ---- Sensors
-	if( ms % 20 == 0 ) job_touch = 1;
+	if( !ms20 ) job_touch = 1;
 	if( autolight )
 	{
 		if( ms % 4 == 2 )  // 25 samples per light slot
@@ -1314,32 +1254,36 @@ static void ms_task( void )
 			duty_acc += duty_q12;
 			ldr_n++;
 		}
-		// Dark-slot blanking (all lamps off for DARK_SLOT_US every LIGHT_SLOT_MS) is commented out for now.
-		// Without it the "ambient" reading is the plain average, i.e. room light + the tree's own light:
-		// auto on/off sees the tree too, and only shadow waves work (reflection = 0).
-		// if( ms % LIGHT_SLOT_MS == 0 ) dark_req = 1;
-		// if( dark_done ) { dark_done = 0; job_light = 1; }
-		if( ms % LIGHT_SLOT_MS == 0 && ldr_n )
+		// Dark-slot blanking (all lamps off for DARK_SLOT_US every LIGHT_SLOT_MS) is off for now
+		// (LIGHT_DARK_SLOT 0, not even compiled: flash is full). Without it the "ambient" reading is the plain
+		// average, i.e. room light + the tree's own light: auto on/off sees the tree too, and only shadow waves
+		// work (reflection = 0).
+#if LIGHT_DARK_SLOT
+		if( !ms100 ) dark_req = 1;
+		if( dark_done ) { dark_done = 0; job_light = 1; }
+#else
+		if( !ms100 && ldr_n )
 		{
 			ldr_dark = ldr_acc / ldr_n;
 			job_light = 1;
 		}
+#endif
 	}
-	else if( ms % LIGHT_SLOT_MS == 0 )
+	else if( !ms100 )
 	{
 		ldr_dark = 0;
 		job_light = 1;  // clears the light features
 	}
 
 	if( ms % 16 == 5 ) job_status = 1;
-	if( ms % 1000 == 500 ) job_stack = 1;
+	if( ms100 == 50 ) job_stack = 1;
 }
 
 // Status block for USB (every 16 ms is plenty), as a deferred job.
 static void status_task( void )
 {
 	uint32_t ms = now_ms;
-	if( ms % 100 < 16 )
+	if( ms100 < 16 )
 	{
 		status.duty_pm = passes ? pulse_passes * 1000 / passes : 0;
 		passes = pulse_passes = 0;
@@ -1353,7 +1297,6 @@ static void status_task( void )
 	status.fault = fault;
 	status.flags = ( touched ? 1 : 0 ) | ( paused ? 2 : 0 ) | ( boost_on ? 4 : 0 );
 	status.hv_set = hv_target_mv / 1000;
-	status.period_us = period / 48;
 	status.hv_cv = hv_mv / 10;
 	status.vdd_mv = vdd_mv;
 	status.adc_vfb = vfb_last;
@@ -1364,8 +1307,6 @@ static void status_task( void )
 	status.lamps = lamps_shown;
 	status.level = level;
 	status.budget = budget > 255 ? 255 : budget;
-	status.pwm_ms = pwm_frame_us / 1000;
-	status.pwm_min_10us = pwm_min_us / 10 > 255 ? 255 : pwm_min_us / 10;
 	status.show = show;
 	status.style = style;
 	status.user_level = user_level;
@@ -1408,8 +1349,11 @@ static void stack_task( void )
 // Inside its window a lamp lights its left electrode first, then the right one.
 static uint32_t lamp_pwm( void )
 {
-	static uint32_t frame_start, dark_until, edge_at;
+	static uint32_t frame_start, edge_at;
+#if LIGHT_DARK_SLOT
+	static uint32_t dark_until;
 	static uint8_t dark;
+#endif
 	uint32_t now = SysTick->CNT;
 
 	// How late is this call for the edge the previous call predicted?
@@ -1420,6 +1364,7 @@ static uint32_t lamp_pwm( void )
 		if( (uint32_t)late > late_peak ) late_peak = late;
 	}
 
+#if LIGHT_DARK_SLOT
 	if( dark )  // light sensor dark slot: everything off, read the room at its end
 	{
 		if( (int32_t)( now - dark_until ) >= 0 )
@@ -1442,6 +1387,7 @@ static uint32_t lamp_pwm( void )
 		edge_at = dark_until;
 		return dark_until - now;
 	}
+#endif
 
 	uint32_t frame = pwm_frame_us * DELAY_US_TIME;
 	uint32_t t = now - frame_start;
@@ -1480,9 +1426,9 @@ static void gpio_init( void )
 	GPIOC->BSHR = 0xffu << 16;
 	GPIOD->BSHR = ( SR_DATA_D | SR_LATCH_D | 1u ) << 16;
 	GPIOC->CFGLR = 0x11111111 * GPIO_CFGLR_OUT_50Mhz_PP;  // all of port C
-	funPinMode( PD0, GPIO_CFGLR_OUT_10Mhz_PP );
-	funPinMode( PD5, GPIO_CFGLR_OUT_50Mhz_PP );
-	funPinMode( PD7, GPIO_CFGLR_OUT_50Mhz_PP );
+	// PD0 / PD5 / PD7 outputs, PD3 (HV feedback) analog: one write (PD1 SWIO, PD2 / PD4 USB, PD6 boost stay)
+	GPIOD->CFGLR = ( GPIOD->CFGLR & ~0xf0f0f00fu ) | GPIO_CFGLR_OUT_10Mhz_PP << 0 | GPIO_CFGLR_IN_ANALOG << 12 |
+	               GPIO_CFGLR_OUT_50Mhz_PP << 20 | GPIO_CFGLR_OUT_50Mhz_PP << 28;
 
 	// Every lamp switch off (also latches the random power-up state of the 595s away).
 	outs_write( 0, 0xffffffff );
@@ -1493,9 +1439,7 @@ static void gpio_init( void )
 		a_mask[i] = 1u << lamp_sw[i][1];
 	}
 
-	// Analog inputs
-	funPinMode( PD3, GPIO_CFGLR_IN_ANALOG );
-	funPinMode( PA1, GPIO_CFGLR_IN_ANALOG );
+	funPinMode( PA1, GPIO_CFGLR_IN_ANALOG );  // light sensor
 }
 
 static void iwdg_init( void )
@@ -1513,6 +1457,8 @@ int main()
 {
 	SystemInit();
 	stack_paint();
+	status.period_us = BOOST_PERIOD / 48;  // these status fields change only by command (handle_command)
+	status.pwm_ms = PWM_FRAME_MS_DEFAULT;
 
 	gpio_init();  // lamps off before anything else (R2 holds the boost gate low until TIM2 runs)
 
@@ -1528,14 +1474,11 @@ int main()
 	status.uid = *(volatile uint32_t *)0x1ffff7e8 ^ *(volatile uint32_t *)0x1ffff7ec ^ *(volatile uint32_t *)0x1ffff7f0;
 
 	// Force re-enumeration: the bootloader may have just been on the bus with the same D- pull-up.
-	funPinMode( PD4, GPIO_CFGLR_OUT_10Mhz_PP );
-	GPIOD->BSHR = 1u << ( 4 + 16 );
-	Delay_Ms( 20 );
+	usb_disconnect();
 	usb_setup();
 
 	adc_init();
 	measure_vdd();
-	hv_scale_update();
 	boost_init();
 	iwdg_init();
 

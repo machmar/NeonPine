@@ -6,3 +6,4 @@ deps/
 *.map
 __pycache__/
 bootloader_image.h
+*.o

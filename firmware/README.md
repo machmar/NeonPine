@@ -9,7 +9,7 @@
 | `tools/npflash.py` | Flashes the firmware over USB with the companion's flasher (Linux + Windows), verified |
 | `np.ps1` | Windows: build, flash and control from PowerShell (see *Setup › Windows*) |
 | `../companion/` | The **NeonPine Companion** desktop app (Linux + Windows, tray): animations, custom keyframe animations, live modes, settings, diagnostics, firmware updates |
-| `tools/gen_anim_tables.py` | Generates `neonpine/anim_tables.h` (sine, e^−x, noise permutation) |
+| `tools/gen_anim_tables.py` | Generates `neonpine/anim_tables.h` (sine, 2^−x for e^−x; the noise hash is computed, `wang()` in `anim.c`) |
 | `tools/99-neonpine.rules` | udev rule: user access to the bootloader, the firmware and the WCH‑LinkE |
 
 ## Setup (once per PC)
@@ -39,7 +39,7 @@ py -m venv ..\companion\.venv; ..\companion\.venv\Scripts\python -m pip install 
 | `.\np.ps1 status`, `watch`, `show garland`, `style retro`, … | `tools/npctl.py` |
 
 MSYS2's riscv64 GCC 14 has no rv32ec multilib; that's fine, ch32fun links its own `misc/libgcc.a`.
-Its build of `neonpine.bin` is 15 352 of the 15 360 bytes allowed.
+Its build of `neonpine.bin` is 14 308 of the 15 360 bytes allowed (see *Flash budget* below).
 
 **Firmware older than the Windows reboot fix** (USB reboot report handled by rv003usb itself): Windows never sees the
 bootloader after a soft reboot, because the chip restarts without leaving the bus and Windows, unlike Linux, doesn't
@@ -164,7 +164,8 @@ instead of glowing at the minimum on-time (candle dips out, breathe goes dark on
 | hold 3 s | off / on. While off, nothing else reacts (like the simulator) |
 
 Tap and wave step through the **tap list** (setting; default the eight animations, custom ones can be added).
-Touch threshold: baseline + 500 (board 1: idle ±160, touched +1100…+2000). The baseline is taken in the first 0.3 s,
+Touch threshold: baseline + 500 (board 1: idle ±160, touched +1100…+2000; with the rolled-up `touch_read()` of
+2026-11-12 idle sits ~300 higher, peaks ≤ +190 over all animations). The baseline is taken in the first 0.3 s,
 so don't touch the pad while plugging in.
 
 ### Store: settings and custom animations (fw v3)
@@ -182,12 +183,27 @@ write waits 3 ms after the USB request so its status stage completes first. **Fi
 bytes** so updates don't erase the store – `make` checks it (`size-check`); minichlink and the app only erase the image's
 own pages.
 
-RAM is the tight resource (2 kB, 460 B of it is the touch routine running from RAM): `npctl.py` / the app show the stack
-never used since power‑up (board 1, after hammering USB: 168 B free).
+RAM: 2 kB, 1 480 B used (.data + .bss; 278 B of it is `touch_read()`, which runs from RAM). `npctl.py` / the app show
+the stack never used since power‑up (board 1, 2026-11-12, all animations, store and live traffic: 364 B free).
+
+### Flash budget
+16 kB flash − 1 kB store = 15 360 B for the image. 2026-11-12 it went from 15 352 to 14 308 B (GCC 14, MSYS2):
+* `touch_read()` replaces ch32fun's `ReadTouchPin()`: the same 9 samples, but its 3 copies of the sample block are one
+  loop with a jump into a nop sled (−210 B flash and RAM). It uses its own copy of `FORCEALIGNADC`: the original
+  `jalr a2, 1` overwrites `ra` without declaring it, which crashes a leaf function (watchdog reset loop).
+* e^−x from a 17-entry 2^−f table, the noise hash computed instead of a 256-byte permutation (−420 B). The companion's
+  `builtin.py` has the same math: a PC build of `anim.c` and `builtin.py` agree on every value (6 modes × both styles ×
+  20 electrodes × 225 times). The deterministic modes moved ≤ 2/4096; candle, twinkle and snowfall have the same
+  statistics but a different random pattern.
+* The unused light-sensor dark slot is `#if LIGHT_DARK_SLOT` (−96 B), small cleanups in `neonpine.c`.
+* Size flags `-msave-restore -fno-gcse` for everything but the USB path: `usb.c` (rv003usb.c + the report hooks) is
+  its own object with the stock flags and no LTO, so the interrupt keeps the timing that was tested.
+  **Don't use `-mtune=size`** on this chip without `-mstrict-align`: its cost model emits misaligned loads/stores,
+  which the QingKe V2A traps on (store reads crashed the tree). With `-mstrict-align` it saves nothing here.
 
 ### Light sensor (Q2 TEPT4400 – not fitted on board 1 yet, untested)
 Every 100 ms all lamps would go dark for 0.5 ms while PA1 is read, giving room light without the tree's own
-light (DESIGN.md: 44 mV per lux). **That blanking is commented out for now** (`ms_task`): the reading is the plain
+light (DESIGN.md: 44 mV per lux). **That blanking is off for now** (`LIGHT_DARK_SLOT 0`, not compiled): the reading is the plain
 average, so it includes the tree's own light, and waves are only detected as shadows.
 * **Off in daylight** above 100 lx, **on at dusk** below 20 lx, each after 5 s. The simulator says 150 lx, but with
   the 22k load the sensor saturates at ≈ 110 lx.

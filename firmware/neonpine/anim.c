@@ -112,17 +112,28 @@ static int32_t sinq( uint32_t ph )  // ph: 65536 = one turn
 	return a + ( ( b - a ) * f >> 8 );
 }
 
-static int32_t expneg( int32_t x )  // e^-x, x in Q12 >= 0
+static int32_t expneg( int32_t x )  // e^-x, x in Q12 >= 0: 2^-(x log2 e) = 2^-f (table, 1/16 steps) >> n
 {
 	if( x <= 0 ) return Q;
 	if( x >= 8 * Q ) return 0;
-	int32_t i = x >> 8, f = x & 255, a = expneg_tab[i], b = expneg_tab[i + 1];
-	return a + ( ( b - a ) * f >> 8 );
+	uint32_t y = (uint32_t)x * 5909 >> 12;  // * log2(e), Q12
+	int32_t i = ( y >> 8 ) & 15, f = y & 255, a = exp2_tab[i], b = exp2_tab[i + 1];
+	return ( a + ( ( b - a ) * f >> 8 ) ) >> ( y >> 12 );
 }
 
-static int32_t hashq( uint32_t seed, uint32_t i )  // pseudo-random 0..4080 per (seed, lattice point)
+static uint32_t wang( uint32_t k )  // Thomas Wang's 32-bit integer hash, multiplier-free form
 {
-	return perm_tab[( perm_tab[( i ^ ( i >> 8 ) ) & 255] + seed ) & 255] << 4;
+	k = ~k + ( k << 15 );
+	k ^= k >> 12;
+	k += k << 2;
+	k ^= k >> 4;
+	k += ( k << 3 ) + ( k << 11 );  // * 2057
+	return k ^ ( k >> 16 );
+}
+
+static int32_t hashq( uint32_t seed, uint32_t i )  // pseudo-random 0..4080 per (seed, lattice point i < 2^16)
+{
+	return wang( wang( i ) + seed ) >> 24 << 4;
 }
 
 static int32_t vnoise( uint32_t seed, uint32_t x )  // value noise, x in Q16 lattice units

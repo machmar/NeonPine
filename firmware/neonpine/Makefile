@@ -10,8 +10,15 @@ RV003USB:=../deps/rv003usb
 CH32FUN:=$(RV003USB)/ch32fun/ch32fun
 TARGET_MCU:=CH32V003
 
-ADDITIONAL_C_FILES+=$(RV003USB)/rv003usb/rv003usb.S $(RV003USB)/rv003usb/rv003usb.c anim.c
+# usb.o = rv003usb.c + the HID report hooks, built on its own (rule below); everything else is one LTO build.
+ADDITIONAL_C_FILES+=$(RV003USB)/rv003usb/rv003usb.S usb.o anim.c
 EXTRA_CFLAGS:=-I. -I$(RV003USB)/lib -I$(RV003USB)/rv003usb -I$(CH32FUN)/../extralibs
+# Size (~150 B with GCC 14): shared prologue/epilogue routines, and no global CSE (it keeps addresses in
+# registers; with RV32E's 16 that mostly means spills). Kept out of the USB interrupt path (usb.o).
+# Not -mtune=size: its cost model allows misaligned loads/stores, which the CH32V003 core traps on
+# (the store read of the tree name crashed the chip into a watchdog reset loop).
+SIZE_CFLAGS:=-msave-restore -fno-gcse
+EXTRA_CFLAGS+=$(SIZE_CFLAGS)
 
 # -C b003boot: talk to the USB bootloader (1209:B003); minichlink reboots a running app (1209:D003) into it first.
 FLASH_COMMAND=$(MINICHLINK)/minichlink -C b003boot -w $(TARGET).bin flash -b
@@ -31,4 +38,9 @@ flash : size-check cv_flash
 flash-swd : $(TARGET).bin $(MINICHLINK)/minichlink
 	$(MINICHLINK)/minichlink -w $< flash -b
 
+# The USB path with ch32fun's stock flags and no LTO (see usb.c).
+usb.o : usb.c usb_config.h np_usb.h anim.h funconfig.h $(RV003USB)/rv003usb/rv003usb.c $(RV003USB)/rv003usb/rv003usb.h
+	$(PREFIX)-gcc -c -o $@ $< $(filter-out -flto $(SIZE_CFLAGS),$(CFLAGS))
+
 clean : cv_clean
+	rm -f usb.o
