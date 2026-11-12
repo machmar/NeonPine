@@ -124,7 +124,7 @@ enum { GESTURE_TAP = 1, GESTURE_DOUBLE = 2, GESTURE_HOLD = 3, GESTURE_LONG = 4, 
 #define TOUCH_RELEASE_DIV    2     // released below baseline + delta / 2 (hysteresis)
 #define TAP_MAX_MS           450   // shorter press = tap
 #define DOUBLE_GAP_MS        350   // next tap within this after a release = double / triple tap
-#define LONG_HOLD_MS         3000  // off / on
+#define LONG_HOLD_MS         2500  // off / on (off: warning, fade out, see FX_WARN)
 #define USER_LEVEL_MIN       8
 
 // Light sensor: TEPT4400 + 22k, DESIGN.md: 100 lx -> 4.4 V, i.e. 44 mV per lux.
@@ -252,6 +252,32 @@ static uint8_t cfg_dirty;
 static uint32_t cfg_dirty_ms, live_until;
 static uint8_t live_return = ANIM_CANDLE;
 static int32_t sleep_q = Q, adapt_q = Q, anim_sm = Q, anim_L = Q;  // Q12 factors
+
+// ---- Touch feedback ---------------------------------------------------------------------------
+// Drawn over the animation frame in publish_lamp(): a brightness factor fx_m (dip, fades), and a picture
+// fx_o (gauge, hourglass) blended in by fx_w. Both glide (FX_SLEW per ms), so nothing ever jumps.
+enum { FX_NONE, FX_DIP, FX_FADEIN, FX_WARN, FX_GAUGE, FX_GLASS };
+#define DIP_MS      250   // tap: down to ~5 % in this, the next show starts, back up in this
+#define FADEIN_MS   1500  // switching on
+#define WARN_MS     500   // hold: down to 30 % and back up in 2 x this; still held -> fade out, off
+#define FADEOUT_MS  1500  // let go any time before the end: it comes back up
+#define GAUGE_MS    400   // the gauge stays this long after the hold
+#define GLASS_MS    75    // hourglass: a grain glides one tier in this; ~1.3 s to fill, then held full
+#define GLASS_END   ( 21 * 256 )
+#define FX_SLEW     16    // Q12 per ms: ~0.25 s from one picture / brightness to the next
+static uint8_t fx = FX_FADEIN, fx_rev, fx_show;  // fx_show: show + 1 to start at the bottom of the dip
+static uint32_t fx_t0;
+static int32_t fx_m, fx_w;
+static int16_t fx_o[20];  // overlay picture, Q12 per electrode (2i = e1, 2i + 1 = e2)
+// Gauge: angle of each electrode around L5, clockwise from L10, 0-255 (L5 = 0: always lit).
+static const uint8_t gauge_ang[20] = { 171, 181, 140, 150, 202, 213, 112, 112, 0, 0,
+                                       240, 240, 100, 98, 85, 75, 23, 12, 0, 0 };
+// Hourglass: where the grains land, bottom tier first: lamp | tier << 4 | position in the tier << 6.
+static const uint8_t glass_to[10] = { 6 | 3 << 4, 7 | 3 << 4 | 1 << 6, 8 | 3 << 4 | 2 << 6, 9 | 3 << 4 | 3 << 6,
+                                      3 | 2 << 4, 4 | 2 << 4 | 1 << 6, 5 | 2 << 4 | 2 << 6,
+                                      1 | 1 << 4, 2 | 1 << 4 | 1 << 6, 0 };
+
+static void fx_start( int f ) { fx = f; fx_t0 = now_ms; }
 
 // Lamp PWM. Published on-times (us, per lamp and electrode) -> full_on (ticks) -> nx (ticks, after the
 // power budget; scale job) -> on (what lamp_pwm uses; each lamp takes nx at the start of its own window,
@@ -393,6 +419,8 @@ static void publish_lamp( void )
 		int32_t a = anim_e1[i] * anim_sm >> 12, b = anim_e2[i] * anim_sm >> 12;
 		int32_t s = a + b;
 		if( s > Q ) { a = a * Q / s; b = Q - a; }  // share() before the brightness factor, like the simulator
+		a += ( fx_o[2 * i] - a ) * fx_w >> 12; b += ( fx_o[2 * i + 1] - b ) * fx_w >> 12;
+		a = a * fx_m >> 12; b = b * fx_m >> 12;
 		lamp_times( i, a * anim_L >> 12, b * anim_L >> 12 );
 	}
 	if( ++pub_i == 10 && ( pub_states ? !anim_active : anim_active ) ) lamps_commit();
@@ -567,6 +595,7 @@ static void power_on( void )
 {
 	mode = MODE_AUTO;
 	kick_until = now_ms + KICK_MS;
+	fx_start( FX_FADEIN );
 }
 
 static void power_off( void )
@@ -606,23 +635,96 @@ static int next_show( void )
 	return s < ANIMS ? s : ANIM_CANDLE;
 }
 
+static int slew( int32_t x, int32_t to ) { return x + FX_SLEW < to ? x + FX_SLEW : x - FX_SLEW > to ? x - FX_SLEW : to; }
+
+// Every ms while something runs or glides.
+static void fx_task( void )
+{
+	uint32_t t = now_ms - fx_t0;
+	int32_t m = Q, over = 0;
+	if( fx == FX_DIP )
+	{
+		if( t >= DIP_MS && fx_show ) { set_show( fx_show - 1 ); fx_show = 0; state_changed(); }
+		int d = t < DIP_MS ? DIP_MS - t : t - DIP_MS;
+		m = 200 + ( Q - 200 ) * d / DIP_MS;
+		if( t >= 2 * DIP_MS ) fx = 0;
+	}
+	else if( fx == FX_FADEIN )
+	{
+		m = t * Q / FADEIN_MS;
+		m = m * m >> 12;
+		fx_m = m;  // from dark: no glide
+		if( t >= FADEIN_MS ) fx = 0;
+	}
+	else if( fx == FX_WARN )
+	{
+		if( t < 2 * WARN_MS )
+		{
+			int d = t < WARN_MS ? WARN_MS - t : t - WARN_MS;
+			m = 1229 + ( Q - 1229 ) * d / WARN_MS;
+		}
+		else
+		{
+			t -= 2 * WARN_MS;
+			m = t >= FADEOUT_MS ? 0 : Q - t * Q / FADEOUT_MS;
+			m = m * m >> 12;
+			fx_m = m;
+			if( t >= FADEOUT_MS ) { fx = 0; power_off(); }
+		}
+	}
+	else if( fx == FX_GAUGE )
+	{
+		// Soft needle: an electrode lights up over 12 angle units as the level passes it.
+		over = 1;
+		int th = ( user_level - USER_LEVEL_MIN ) * 255 / ( 255 - USER_LEVEL_MIN ) + 12;
+		for( int j = 0; j < 20; j++ )
+		{
+			int v = ( th - gauge_ang[j] ) * ( Q / 24 );
+			fx_o[j] = v < 0 ? 0 : v > Q / 2 ? Q / 2 : v;
+		}
+		if( t >= GAUGE_MS ) fx = 0;
+	}
+	else if( fx == FX_GLASS )
+	{
+		// A stream of grains glides from the star down to the lowest free lamps (cross-fading lamp to lamp),
+		// a new one every 1.5 tiers; backwards (sleep off) they rise out again.
+		over = 1;
+		int u = t * 256 / GLASS_MS, s = fx_rev ? GLASS_END - u : u;
+		for( int j = 0; j < 20; j++ ) fx_o[j] = 0;
+		for( int g = 0; g < 10 && s >= 0; g++, s -= 384 )
+		{
+			int c = glass_to[g], n = c & 15, r = c >> 4 & 3, p = c >> 6;
+			if( s >= r * 256 ) { fx_o[2 * n] = fx_o[2 * n + 1] = Q / 2; continue; }
+			int k = s >> 8, f = s & 255;
+			for( int h = 0; h < 2; h++, k++, f = 256 - f )  // tier k gets 1 - f, the next one f
+			{
+				int l = ( k * ( k + 1 ) >> 1 ) + ( p * k + ( r >> 1 ) ) / r;
+				fx_o[2 * l] = fx_o[2 * l + 1] += ( 256 - f ) << 3;  // Q / 2 * ( 1 - f )
+			}
+		}
+		if( u >= GLASS_END ) fx = 0;
+	}
+	fx_m = slew( fx_m, m );
+	fx_w = slew( fx_w, over ? Q : 0 );
+}
+
 static void on_gesture( int g )
 {
 	gesture = ( ( gesture + 0x10 ) & 0xf0 ) | g;
 	if( g == GESTURE_LONG )
 	{
 		if( mode == MODE_OFF ) power_on();
-		else power_off();
+		else fx_start( FX_WARN );
 		return;
 	}
 	if( mode == MODE_OFF || daylight_off ) return;  // off: only "hold 3 s" turns it on (simulator)
 	if( g == GESTURE_TAP || g == GESTURE_WAVE )
 	{
 		mode = MODE_AUTO;
-		set_show( next_show() );
-		state_changed();
+		fx_show = next_show() + 1;
+		fx_start( FX_DIP );
 	}
-	else if( g == GESTURE_DOUBLE ) sleep_set( !sleep_active );
+	else if( g == GESTURE_DOUBLE ) { sleep_set( !sleep_active ); fx_rev = !sleep_active; fx_start( FX_GLASS ); }
 	else if( g == GESTURE_TRIPLE ) { set_style( !style ); state_changed(); }
 }
 
@@ -731,11 +833,13 @@ static void touch_task( void )
 			// Brightness ramp: full range in ~1.7 s.
 			int l = user_level + 3 * ramp_dir;
 			user_level = l < USER_LEVEL_MIN ? USER_LEVEL_MIN : l > 255 ? 255 : l;
+			fx_start( FX_GAUGE );
 		}
 	}
 	else if( !t && touched )  // release
 	{
 		uint32_t held = ms - press_ms;
+		if( fx == FX_WARN ) fx = 0;  // let go before it's off: it stays on (fx_m glides back up)
 		if( held < TAP_MAX_MS ) { taps++; release_ms = ms; }
 		else if( !hold_done ) { ramp_dir = -ramp_dir; gesture = ( ( gesture + 0x10 ) & 0xf0 ) | GESTURE_HOLD; state_changed(); }
 	}
@@ -791,7 +895,7 @@ static void light_task( void )
 	{
 		confirm = 0;
 		daylight_off = !daylight_off;
-		if( !daylight_off ) kick_until = now_ms + KICK_MS;
+		if( !daylight_off ) { kick_until = now_ms + KICK_MS; fx_start( FX_FADEIN ); }
 	}
 
 	// Wave: a short shadow (room lit) or a short rise of the tree's light reflected back (dark room)
@@ -1155,6 +1259,8 @@ static void ms_task( void )
 		if( ++low_ms >= NORISE_MS ) set_fault( FAULT_NO_RISE );
 	}
 	else low_ms = 0;
+
+	if( fx || fx_w || fx_m != Q ) fx_task();
 
 	// ---- Lamps
 	int lamps_ok = on && !fault && boost_on;
